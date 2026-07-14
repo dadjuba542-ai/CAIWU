@@ -1,0 +1,12 @@
+export type Point = { id: number; name: string; position: number; status: string; mastery: number };
+export type Chapter = { id: number; name: string; position: number; points: Point[] };
+export type Subject = { id: number; name: string; position: number; chapters: Chapter[] };
+export type Exam = { id: number; name: string; code: string; subjects: Subject[] };
+export type Doc = { id: number; name: string; original_name: string; mime_type: string; status: string; parse_status: string; outline_status: string; error?: string; exam_id?: number; subject_id?: number; chapter_id?: number; created_at: string };
+export type ProposalNode = { id: number; node_type: "chapter" | "point"; title: string; original_title: string; position: number; confidence: number; source_chunk_ids: number[]; source_locators: string[]; action: "create" | "merge" | "ignore"; target_node_id?: number; children?: ProposalNode[] };
+export type OutlineProposal = { id: number; document_id: number; subject_id: number; status: string; ai_enhanced: boolean; model?: string; error?: string; warning?: string; result_summary: { chapters?: number; points?: number; merge_suggestions?: number; created_chapters?: number; created_points?: number }; nodes: ProposalNode[] };
+export type Citation = { chunk_id: number; document_id: number; document_name: string; locator: string; quote: string };
+export type ChatAnswer = { conversation_id: number; answer: string; citations: Citation[]; reasoning_type: string; grounded: boolean; insufficient_evidence: string[]; suggested_materials: string[]; follow_up_questions: string[] };
+export type Note = { id: number; title: string; content: string; tags: string[]; favorite: boolean; updated_at: string };
+export type Review = { id: number; knowledge_point_id: number; prompt: string; answer: string; citations: Citation[]; due_date: string; interval_days: number; attempts: number };
+export type Dashboard = { review_due: number; documents: number; notes: number; streak: number; progress: number; weak_points: Point[]; recent_session?: { route: string; context: Record<string, unknown> } };
