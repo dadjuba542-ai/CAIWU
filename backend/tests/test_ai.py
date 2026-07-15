@@ -61,3 +61,22 @@ def test_grounded_answer_rejects_claim_without_valid_source(monkeypatch):
     FakeClient.payload = {"claims": [{"text": "无依据结论", "citation_ids": [999], "reasoning_type": "direct"}]}
     with pytest.raises(ValueError, match="无依据结论"):
         ai.grounded_answer(object(), "问题是什么", None, None, "answer")
+
+
+def test_grounded_answer_includes_recent_history_as_context(monkeypatch):
+    monkeypatch.setattr(ai, "retrieve", lambda *_args, **_kwargs: evidence())
+    monkeypatch.setattr(ai, "decrypt_key", lambda _db: ("secret", "deepseek-chat"))
+    monkeypatch.setattr(ai.httpx, "Client", FakeClient)
+    FakeClient.payload = {"claims": [{"text": "结论", "citation_ids": ["C7"], "reasoning_type": "direct"}]}
+    ai.grounded_answer(
+        object(), "那它为什么不能确认？", 1, 2, "answer",
+        history=[{"role": "user", "content": "递延所得税资产是什么？"},
+                 {"role": "assistant", "content": "它需要满足资料中的确认条件。"}],
+        page_context={"view": "study", "subject": "会计", "chapter": "所得税"},
+        conversation_summary="用户已经理解定义，但还不清楚确认条件。",
+    )
+    messages = FakeClient.request["json"]["messages"]
+    assert [item["role"] for item in messages] == ["system", "user", "assistant", "user"]
+    assert messages[-2]["content"] == "它需要满足资料中的确认条件。"
+    assert "所得税" in messages[0]["content"]
+    assert "确认条件" in messages[0]["content"]

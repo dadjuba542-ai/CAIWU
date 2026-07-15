@@ -50,7 +50,32 @@ def decrypt_key(db: Session) -> tuple[str, str]:
     return key, row.model
 
 
-def grounded_answer(db: Session, question: str, subject_id: int | None, chapter_id: int | None, mode: str) -> dict[str, Any]:
+def _expanded_chunk_context(db: Session, chunk: DocumentChunk) -> str:
+    """把命中片段的前后相邻段落带进工作上下文，引用仍归属于命中片段。"""
+    document_id = getattr(chunk, "document_id", None)
+    position = getattr(chunk, "position", None)
+    if document_id is None or position is None or not hasattr(db, "scalars"):
+        return chunk.content
+    rows = db.scalars(
+        select(DocumentChunk).where(
+            DocumentChunk.document_id == document_id,
+            DocumentChunk.position >= max(0, position - 1),
+            DocumentChunk.position <= position + 1,
+        ).order_by(DocumentChunk.position)
+    ).all()
+    return "\n".join(f"{row.locator}：{row.content}" for row in rows)
+
+
+def grounded_answer(
+    db: Session,
+    question: str,
+    subject_id: int | None,
+    chapter_id: int | None,
+    mode: str,
+    history: list[dict[str, str]] | None = None,
+    page_context: dict[str, Any] | None = None,
+    conversation_summary: str = "",
+) -> dict[str, Any]:
     evidence = retrieve(db, question, subject_id, chapter_id)
     citations = [
         {"chunk_id": chunk.id, "document_id": doc.id, "document_name": doc.name,
@@ -64,21 +89,39 @@ def grounded_answer(db: Session, question: str, subject_id: int | None, chapter_
             "insufficient_evidence": ["没有检索到与问题直接相关的资料片段"],
             "suggested_materials": ["相关科目的教材章节", "适用的法规或考试讲义"],
             "follow_up_questions": [],
+            "conversation_summary": conversation_summary,
         }
     api_key, model = decrypt_key(db)
-    evidence_text = "\n\n".join(f"[C{item['chunk_id']}] {item['document_name']} {item['locator']}\n{item['quote']}" for item in citations)
+    evidence_text = "\n\n".join(
+        f"[C{item['chunk_id']}] {item['document_name']} {item['locator']}\n"
+        f"{_expanded_chunk_context(db, chunk)}"
+        for item, (_, chunk, _) in zip(citations, evidence)
+    )
     mode_instruction = "使用苏格拉底式追问，不直接给最终结论。" if mode == "socratic" else "直接、分层地回答。"
+    page_context_text = json.dumps(page_context or {}, ensure_ascii=False)
     system = f"""你是严谨的财务考证助教。你只能使用下方证据，不得使用常识补充。{mode_instruction}
+    历史对话只用于理解当前问题的指代和上下文，不是事实来源；历史内容与下方证据冲突时，以证据为准。
+    当前网页上下文只用于理解用户正在学习的位置，不是事实来源。
+    请在 conversation_summary 中用不超过 500 字总结：用户已经理解什么、仍然困惑什么、下一步适合做什么。
     把回答拆成 claims；每个 claim 必须包含 text、citation_ids 和 reasoning_type(direct/inference)。
     每项结论必须能由其 citation_ids 对应证据直接支持，禁止仅挂一个不相关引用。证据冲突时不得选边，必须列入 insufficient_evidence。
-    仅输出 JSON：claims, insufficient_evidence, suggested_materials, follow_up_questions。
+    仅输出 JSON：claims, insufficient_evidence, suggested_materials, follow_up_questions, conversation_summary。
+当前网页上下文：{page_context_text}
+已有会话摘要：{conversation_summary or "暂无"}
 证据：\n{evidence_text}"""
+    messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+    for item in (history or [])[-8:]:
+        role = item.get("role")
+        content = item.get("content", "").strip()
+        if role in {"user", "assistant"} and content:
+            messages.append({"role": role, "content": content[-3000:]})
+    messages.append({"role": "user", "content": question})
     with httpx.Client(timeout=60) as client:
         response = client.post(
             f"{settings.deepseek_base_url.rstrip('/')}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={"model": model, "response_format": {"type": "json_object"}, "temperature": 0.1,
-                  "messages": [{"role": "system", "content": system}, {"role": "user", "content": question}]},
+                  "messages": messages},
         )
         response.raise_for_status()
         raw = response.json()["choices"][0]["message"]["content"]
@@ -110,4 +153,5 @@ def grounded_answer(db: Session, question: str, subject_id: int | None, chapter_
         "insufficient_evidence": data.get("insufficient_evidence", []),
         "suggested_materials": data.get("suggested_materials", []),
         "follow_up_questions": data.get("follow_up_questions", []),
+        "conversation_summary": str(data.get("conversation_summary", ""))[:2000],
     }

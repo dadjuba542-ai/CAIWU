@@ -1,4 +1,5 @@
 from datetime import date, datetime
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -85,6 +86,7 @@ class AskRequest(BaseModel):
     subject_id: int | None = None
     chapter_id: int | None = None
     mode: str = "answer"
+    page_context: dict[str, Any] = Field(default_factory=dict)
 
 
 class AskResponse(BaseModel):
@@ -96,6 +98,7 @@ class AskResponse(BaseModel):
     insufficient_evidence: list[str]
     suggested_materials: list[str]
     follow_up_questions: list[str]
+    conversation_summary: str = ""
 
 
 class NoteCreate(BaseModel):

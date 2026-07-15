@@ -157,6 +157,7 @@ class Conversation(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     title: Mapped[str] = mapped_column(String(180), default="新学习会话")
     mode: Mapped[str] = mapped_column(String(30), default="answer")
+    summary: Mapped[str] = mapped_column(Text, default="")
     subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True)
     chapter_id: Mapped[int | None] = mapped_column(ForeignKey("chapters.id"), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

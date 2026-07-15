@@ -4,7 +4,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.database import Base
-from app.learning import cosine, embed, schedule_review
+from app.learning import cosine, embed, schedule_review, score_short_answer
 from app.models import Chapter, KnowledgePoint, ReviewItem, Subject, ExamTrack
 
 
@@ -33,3 +33,9 @@ def test_review_quality_updates_interval_and_mastery():
     assert result.interval_days == 2
     assert point.mastery == 64
     assert result.due_date > date.today()
+
+
+def test_short_answer_score_does_not_use_single_character_overlap():
+    expected = "递延所得税资产需要在预计未来有足够应纳税所得额时确认。"
+    assert score_short_answer(expected, "确认条件") < 0.5
+    assert score_short_answer(expected, "递延所得税资产需要在预计未来有足够应纳税所得额时确认。", "递延所得税资产") == 1

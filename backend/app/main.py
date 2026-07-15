@@ -16,7 +16,7 @@ from .ai import grounded_answer
 from .config import settings
 from .database import Base, SessionLocal, engine, get_db
 from .documents import parse_document
-from .learning import embed, schedule_review
+from .learning import embed, schedule_review, score_short_answer
 from .jobs import enqueue
 from .models import (
     AIProviderSetting, Chapter, Conversation, CurriculumProposal, CurriculumSourceLink,
@@ -417,6 +417,12 @@ def discard_outline_proposal(proposal_id: int, db: Session = Depends(get_db)):
 @app.post("/api/ai/ask", response_model=AskResponse)
 def ask(body: AskRequest, db: Session = Depends(get_db)):
     conversation = db.get(Conversation, body.conversation_id) if body.conversation_id else None
+    history = []
+    if conversation:
+        previous_messages = db.scalars(
+            select(Message).where(Message.conversation_id == conversation.id).order_by(Message.id.desc()).limit(8)
+        ).all()
+        history = [{"role": message.role, "content": message.content} for message in reversed(previous_messages)]
     if not conversation:
         conversation = Conversation(title=body.question[:50], mode=body.mode, subject_id=body.subject_id, chapter_id=body.chapter_id)
         db.add(conversation); db.flush()
@@ -425,11 +431,22 @@ def ask(body: AskRequest, db: Session = Depends(get_db)):
     # 先持久化用户输入；DeepSeek 超时、额度不足或返回非法引用时也不能丢问题。
     db.commit()
     try:
-        answer = grounded_answer(db, body.question, body.subject_id, body.chapter_id, body.mode)
+        answer = grounded_answer(
+            db,
+            body.question,
+            body.subject_id,
+            body.chapter_id,
+            body.mode,
+            history=history,
+            page_context=body.page_context,
+            conversation_summary=conversation.summary,
+        )
     except httpx.HTTPStatusError as exc:
         raise HTTPException(502, f"DeepSeek 请求失败：HTTP {exc.response.status_code}")
     except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(422, str(exc))
+    if answer.get("conversation_summary"):
+        conversation.summary = answer["conversation_summary"]
     db.add(Message(conversation_id=conversation.id, role="assistant", content=answer["answer"], payload=answer))
     conversation.updated_at = datetime.utcnow(); db.commit()
     return {"conversation_id": conversation.id, **answer}
@@ -447,7 +464,7 @@ def conversation(conversation_id: int, db: Session = Depends(get_db)):
     row = db.get(Conversation, conversation_id)
     if not row: raise HTTPException(404, "会话不存在")
     messages = db.scalars(select(Message).where(Message.conversation_id == row.id).order_by(Message.id)).all()
-    return {"id": row.id, "title": row.title, "mode": row.mode,
+    return {"id": row.id, "title": row.title, "mode": row.mode, "summary": row.summary,
             "messages": [{"id": m.id, "role": m.role, "content": m.content, "payload": m.payload} for m in messages]}
 
 
@@ -514,7 +531,8 @@ def create_assessment(body: AssessmentCreate, db: Session = Depends(get_db)):
     points = db.scalars(select(KnowledgePoint).where(KnowledgePoint.chapter_id.in_(chapter_ids)).limit(body.question_count)).all()
     assessment = Assessment(subject_id=body.subject_id, chapter_id=body.chapter_id, assessment_type=body.assessment_type)
     db.add(assessment); db.flush()
-    kinds = ["short_answer", "judgement", "calculation", "single_choice", "multiple_choice"]
+    # 当前题目和评分都是简答题；不要把同一个模板伪装成选择题或判断题。
+    kinds = ["short_answer"]
     for position, point in enumerate(points):
         evidence = db.execute(select(DocumentChunk, Document).join(CurriculumSourceLink, CurriculumSourceLink.chunk_id == DocumentChunk.id)
             .join(Document, Document.id == DocumentChunk.document_id)
@@ -549,8 +567,8 @@ def submit_attempt(assessment_id: int, body: AttemptIn, db: Session = Depends(ge
     if existing: return {"id": existing.id, "score": existing.score, "idempotent": True}
     question = db.get(Question, body.question_id)
     if not question or question.assessment_id != assessment_id: raise HTTPException(404, "题目不存在")
-    expected = set(question.answer); actual = set(body.response)
-    score = round(len(expected & actual) / max(1, len(expected)), 2)
+    point = db.get(KnowledgePoint, question.knowledge_point_id) if question.knowledge_point_id else None
+    score = score_short_answer(question.answer, body.response, point.name if point else "")
     attempt = QuestionAttempt(assessment_id=assessment_id, question_id=question.id, response=body.response,
         score=score, self_rating=body.self_rating, duration_seconds=body.duration_seconds)
     db.add(attempt); db.flush()
