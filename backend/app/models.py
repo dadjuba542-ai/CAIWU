@@ -3,6 +3,7 @@ from enum import Enum
 
 from sqlalchemy import Boolean, Date, DateTime, Float, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
+from pgvector.sqlalchemy import Vector
 
 from .database import Base
 
@@ -84,6 +85,26 @@ class DocumentChunk(Base):
     heading: Mapped[str | None] = mapped_column(String(255), nullable=True)
     position: Mapped[int] = mapped_column(default=0)
     embedding: Mapped[list[float]] = mapped_column(JSON)
+    vector: Mapped[list[float] | None] = mapped_column(Vector(512), nullable=True)
+    embedding_model: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    index_version: Mapped[int] = mapped_column(Integer, default=1)
+    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+
+class ProcessingJob(Base):
+    __tablename__ = "processing_jobs"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(40))
+    status: Mapped[str] = mapped_column(String(30), default="queued")
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    max_attempts: Mapped[int] = mapped_column(Integer, default=3)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    locked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
 class CurriculumProposal(Base):
@@ -189,6 +210,68 @@ class StudySession(Base):
     route: Mapped[str] = mapped_column(String(120), default="dashboard")
     context: Mapped[dict] = mapped_column(JSON, default=dict)
     studied_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Assessment(Base):
+    __tablename__ = "assessments"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int] = mapped_column(ForeignKey("subjects.id"))
+    chapter_id: Mapped[int | None] = mapped_column(ForeignKey("chapters.id"), nullable=True)
+    assessment_type: Mapped[str] = mapped_column(String(30), default="diagnostic")
+    status: Mapped[str] = mapped_column(String(30), default="ready")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class Question(Base):
+    __tablename__ = "questions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assessment_id: Mapped[int] = mapped_column(ForeignKey("assessments.id"))
+    knowledge_point_id: Mapped[int | None] = mapped_column(ForeignKey("knowledge_points.id"), nullable=True)
+    question_type: Mapped[str] = mapped_column(String(30))
+    prompt: Mapped[str] = mapped_column(Text)
+    options: Mapped[list] = mapped_column(JSON, default=list)
+    answer: Mapped[str] = mapped_column(Text)
+    explanation: Mapped[str] = mapped_column(Text)
+    citations: Mapped[list] = mapped_column(JSON, default=list)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class QuestionAttempt(Base):
+    __tablename__ = "question_attempts"
+    __table_args__ = (UniqueConstraint("assessment_id", "question_id", name="uq_assessment_question_attempt"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    assessment_id: Mapped[int] = mapped_column(ForeignKey("assessments.id"))
+    question_id: Mapped[int] = mapped_column(ForeignKey("questions.id"))
+    response: Mapped[str] = mapped_column(Text)
+    score: Mapped[float] = mapped_column(Float)
+    self_rating: Mapped[int] = mapped_column(Integer, default=3)
+    duration_seconds: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class MasteryEvent(Base):
+    __tablename__ = "mastery_events"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    knowledge_point_id: Mapped[int] = mapped_column(ForeignKey("knowledge_points.id"))
+    source_type: Mapped[str] = mapped_column(String(30))
+    source_id: Mapped[int | None] = mapped_column(nullable=True)
+    delta: Mapped[float] = mapped_column(Float)
+    before_value: Mapped[float] = mapped_column(Float)
+    after_value: Mapped[float] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+
+
+class LearningSnapshot(Base):
+    __tablename__ = "learning_snapshots"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    subject_id: Mapped[int | None] = mapped_column(ForeignKey("subjects.id"), nullable=True)
+    chapter_id: Mapped[int | None] = mapped_column(ForeignKey("chapters.id"), nullable=True)
+    goal: Mapped[str] = mapped_column(Text, default="")
+    progress: Mapped[dict] = mapped_column(JSON, default=dict)
+    weak_points: Mapped[list] = mapped_column(JSON, default=list)
+    next_steps: Mapped[list] = mapped_column(JSON, default=list)
+    context: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
 
 class AIProviderSetting(Base):

@@ -1,5 +1,7 @@
-import shutil
 import uuid
+import json
+import subprocess
+import tarfile
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -15,15 +17,16 @@ from .config import settings
 from .database import Base, SessionLocal, engine, get_db
 from .documents import parse_document
 from .learning import embed, schedule_review
+from .jobs import enqueue
 from .models import (
     AIProviderSetting, Chapter, Conversation, CurriculumProposal, CurriculumSourceLink,
     Document, DocumentChunk, ExamTrack, KnowledgePoint, Message, Note, ProposalNode,
-    ReviewItem, StudySession, Subject,
+    ReviewItem, StudySession, Subject, ProcessingJob, Assessment, Question, QuestionAttempt, MasteryEvent, LearningSnapshot,
 )
 from .schemas import (
     AISettingIn, AISettingOut, AskRequest, AskResponse, DocumentOut, DocumentUpdate,
     ExamOut, NoteCreate, NoteOut, ProposalUpdate, ReviewOut, ReviewResult,
-    SessionIn, TreeNodeCreate, TreeNodeUpdate,
+    SessionIn, TreeNodeCreate, TreeNodeUpdate, AssessmentCreate, AttemptIn,
 )
 from .outlines import process_outline
 
@@ -58,11 +61,6 @@ def seed_curricula(db: Session) -> None:
         for index, subject_name in enumerate(subjects):
             subject = Subject(exam_id=exam.id, name=subject_name, position=index)
             db.add(subject)
-            db.flush()
-            chapter = Chapter(subject_id=subject.id, name="未编排章节", position=0)
-            db.add(chapter)
-            db.flush()
-            db.add(KnowledgePoint(chapter_id=chapter.id, name="上传资料后编辑知识点", position=0))
     db.commit()
 
 
@@ -78,17 +76,13 @@ def migrate_additive_schema() -> None:
 
 def initialize_application() -> None:
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
-    Base.metadata.create_all(engine)
-    migrate_additive_schema()
     with SessionLocal() as db:
         seed_curricula(db)
-        interrupted = db.scalars(select(CurriculumProposal).where(CurriculumProposal.status.in_(["extracting", "enhancing"]))).all()
-        for proposal in interrupted:
-            proposal.status = "failed"
-            proposal.error = "服务重启导致任务中断，请点击重试。"
-            document = db.get(Document, proposal.document_id)
-            if document:
-                document.outline_status = "failed"
+        if db.scalar(select(func.count()).select_from(DocumentChunk).where(DocumentChunk.vector.is_(None))):
+            existing = db.scalar(select(ProcessingJob).where(ProcessingJob.job_type == "backfill_vectors",
+                                                               ProcessingJob.status.in_(["queued", "running"])))
+            if not existing:
+                enqueue(db, "backfill_vectors", {})
         db.commit()
 
 
@@ -157,34 +151,37 @@ def upload_document(
     subject_id: int = Form(...), chapter_id: int | None = Form(None),
     db: Session = Depends(get_db),
 ):
+    subject = db.get(Subject, subject_id)
+    if not subject:
+        raise HTTPException(400, "上传资料必须选择有效科目")
+    if exam_id and exam_id != subject.exam_id:
+        raise HTTPException(400, "考试项目与所选科目不匹配")
+    if chapter_id:
+        chapter = db.get(Chapter, chapter_id)
+        if not chapter or chapter.subject_id != subject_id:
+            raise HTTPException(400, "章节不属于所选科目")
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in {".pdf", ".docx", ".txt", ".md", ".markdown"}:
         raise HTTPException(400, "仅支持 PDF、DOCX、TXT 和 Markdown")
     target = settings.storage_dir / f"{uuid.uuid4().hex}{suffix}"
-    with target.open("wb") as output:
-        shutil.copyfileobj(file.file, output)
-    subject = db.get(Subject, subject_id)
-    if not subject:
+    written = 0
+    try:
+        with target.open("wb") as output:
+            while block := file.file.read(1024 * 1024):
+                written += len(block)
+                if written > settings.max_upload_bytes:
+                    raise HTTPException(413, f"文件不能超过 {settings.max_upload_bytes // 1024 // 1024} MB")
+                output.write(block)
+    except Exception:
         target.unlink(missing_ok=True)
-        raise HTTPException(400, "上传资料必须选择有效科目")
+        raise
     row = Document(name=Path(file.filename or "资料").stem, original_name=file.filename or "资料",
                    path=str(target), mime_type=file.content_type or "application/octet-stream",
                    exam_id=exam_id or subject.exam_id, subject_id=subject_id, chapter_id=chapter_id,
                    parse_status="processing", outline_status="waiting")
     db.add(row); db.commit(); db.refresh(row)
-    try:
-        parsed = parse_document(target, suffix)
-        for index, chunk in enumerate(parsed):
-            db.add(DocumentChunk(document_id=row.id, position=index, embedding=embed(chunk["content"]), **chunk))
-        row.status = "ready"; row.parse_status = "ready"; row.outline_status = "extracting"
-        db.commit(); db.refresh(row)
-        proposal = CurriculumProposal(document_id=row.id, subject_id=subject_id, status="extracting")
-        db.add(proposal); db.commit(); db.refresh(proposal)
-        background_tasks.add_task(process_outline, proposal.id)
-    except Exception as exc:
-        row.status = "failed"; row.parse_status = "failed"; row.outline_status = "failed"; row.error = str(exc)[:500]
-    db.commit(); db.refresh(row)
-    return row
+    job = enqueue(db, "parse_document", {"document_id": row.id})
+    return {**DocumentOut.model_validate(row).model_dump(), "job_id": job.id}
 
 
 @app.get("/api/documents/{document_id}/chunks")
@@ -211,22 +208,34 @@ def update_document(document_id: int, body: DocumentUpdate, db: Session = Depend
 def reindex_document(document_id: int, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     row = db.get(Document, document_id)
     if not row: raise HTTPException(404, "资料不存在")
-    db.query(CurriculumSourceLink).filter(CurriculumSourceLink.document_id == row.id).delete(synchronize_session=False)
-    db.query(DocumentChunk).filter(DocumentChunk.document_id == row.id).delete()
     row.status = "processing"; row.parse_status = "processing"; row.outline_status = "waiting"; row.error = None; db.commit()
-    try:
-        parsed = parse_document(Path(row.path), Path(row.path).suffix)
-        for index, chunk in enumerate(parsed):
-            db.add(DocumentChunk(document_id=row.id, position=index, embedding=embed(chunk["content"]), **chunk))
-        row.status = "ready"; row.parse_status = "ready"; row.outline_status = "extracting"
-        db.commit(); db.refresh(row)
-        if row.subject_id:
-            proposal = CurriculumProposal(document_id=row.id, subject_id=row.subject_id, status="extracting")
-            db.add(proposal); db.commit(); db.refresh(proposal)
-            background_tasks.add_task(process_outline, proposal.id)
-    except Exception as exc:
-        row.status = "failed"; row.parse_status = "failed"; row.outline_status = "failed"; row.error = str(exc)[:500]
-    db.commit(); db.refresh(row); return row
+    job = enqueue(db, "reindex_document", {"document_id": row.id})
+    return {**DocumentOut.model_validate(row).model_dump(), "job_id": job.id}
+
+
+@app.get("/api/jobs/{job_id}")
+def get_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(ProcessingJob, job_id)
+    if not job: raise HTTPException(404, "任务不存在")
+    return {"id": job.id, "type": job.job_type, "status": job.status, "progress": job.progress,
+            "attempts": job.attempts, "error": job.error, "payload": job.payload}
+
+
+@app.post("/api/jobs/{job_id}/retry")
+def retry_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(ProcessingJob, job_id)
+    if not job: raise HTTPException(404, "任务不存在")
+    if job.status not in {"failed", "cancelled"}: raise HTTPException(409, "只有失败或取消任务可以重试")
+    job.status = "queued"; job.error = None; job.locked_at = None; job.progress = 0; db.commit()
+    return {"ok": True}
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+def cancel_job(job_id: int, db: Session = Depends(get_db)):
+    job = db.get(ProcessingJob, job_id)
+    if not job: raise HTTPException(404, "任务不存在")
+    if job.status == "completed": raise HTTPException(409, "已完成任务不能取消")
+    job.status = "cancelled"; db.commit(); return {"ok": True}
 
 
 @app.delete("/api/documents/{document_id}")
@@ -345,7 +354,8 @@ def confirm_outline_proposal(proposal_id: int, db: Session = Depends(get_db)):
             if chapter and chapter.subject_id != proposal.subject_id:
                 raise HTTPException(400, "合并目标不属于当前科目")
             if not chapter:
-                chapter = Chapter(subject_id=proposal.subject_id, name=node.title, position=node.position)
+                max_position = db.scalar(select(func.max(Chapter.position)).where(Chapter.subject_id == proposal.subject_id))
+                chapter = Chapter(subject_id=proposal.subject_id, name=node.title, position=(max_position if max_position is not None else -1) + 1)
                 db.add(chapter); db.flush(); created_chapters += 1
             else:
                 merged += 1
@@ -411,12 +421,15 @@ def ask(body: AskRequest, db: Session = Depends(get_db)):
         conversation = Conversation(title=body.question[:50], mode=body.mode, subject_id=body.subject_id, chapter_id=body.chapter_id)
         db.add(conversation); db.flush()
     db.add(Message(conversation_id=conversation.id, role="user", content=body.question))
+    conversation.updated_at = datetime.utcnow()
+    # 先持久化用户输入；DeepSeek 超时、额度不足或返回非法引用时也不能丢问题。
+    db.commit()
     try:
         answer = grounded_answer(db, body.question, body.subject_id, body.chapter_id, body.mode)
     except httpx.HTTPStatusError as exc:
-        db.rollback(); raise HTTPException(502, f"DeepSeek 请求失败：HTTP {exc.response.status_code}")
+        raise HTTPException(502, f"DeepSeek 请求失败：HTTP {exc.response.status_code}")
     except (httpx.HTTPError, ValueError) as exc:
-        db.rollback(); raise HTTPException(422, str(exc))
+        raise HTTPException(422, str(exc))
     db.add(Message(conversation_id=conversation.id, role="assistant", content=answer["answer"], payload=answer))
     conversation.updated_at = datetime.utcnow(); db.commit()
     return {"conversation_id": conversation.id, **answer}
@@ -469,8 +482,20 @@ def create_review(point_id: int, db: Session = Depends(get_db)):
     if not point: raise HTTPException(404, "知识点不存在")
     existing = db.scalar(select(ReviewItem).where(ReviewItem.knowledge_point_id == point_id))
     if existing: return existing
-    row = ReviewItem(knowledge_point_id=point.id, prompt=f"请用自己的话解释：{point.name}",
-                     answer="请结合已上传资料核对你的解释。", due_date=date.today())
+    evidence = db.execute(
+        select(DocumentChunk, Document).join(Document, DocumentChunk.document_id == Document.id)
+        .join(CurriculumSourceLink, CurriculumSourceLink.chunk_id == DocumentChunk.id)
+        .where(CurriculumSourceLink.knowledge_point_id == point_id, Document.status == "ready")
+        .order_by(DocumentChunk.position).limit(3)
+    ).all()
+    if not evidence:
+        raise HTTPException(409, "该知识点没有可用资料来源，暂不能生成复习项")
+    citations = [{"chunk_id": chunk.id, "document_id": document.id, "document_name": document.name,
+                  "locator": chunk.locator, "quote": chunk.content}
+                 for chunk, document in evidence]
+    answer = "\n\n".join(f"[{item['document_name']} · {item['locator']}]\n{item['quote']}" for item in citations)
+    row = ReviewItem(knowledge_point_id=point.id, prompt=f"不看资料，解释“{point.name}”的核心规则、适用前提和易错点。",
+                     answer=answer, citations=citations, due_date=date.today())
     db.add(row); db.commit(); db.refresh(row); return row
 
 
@@ -479,6 +504,87 @@ def complete_review(review_id: int, body: ReviewResult, db: Session = Depends(ge
     row = db.get(ReviewItem, review_id)
     if not row: raise HTTPException(404, "复习任务不存在")
     return schedule_review(db, row, body.quality)
+
+
+@app.post("/api/assessments")
+def create_assessment(body: AssessmentCreate, db: Session = Depends(get_db)):
+    chapter_ids = select(Chapter.id).where(Chapter.subject_id == body.subject_id)
+    if body.chapter_id:
+        chapter_ids = chapter_ids.where(Chapter.id == body.chapter_id)
+    points = db.scalars(select(KnowledgePoint).where(KnowledgePoint.chapter_id.in_(chapter_ids)).limit(body.question_count)).all()
+    assessment = Assessment(subject_id=body.subject_id, chapter_id=body.chapter_id, assessment_type=body.assessment_type)
+    db.add(assessment); db.flush()
+    kinds = ["short_answer", "judgement", "calculation", "single_choice", "multiple_choice"]
+    for position, point in enumerate(points):
+        evidence = db.execute(select(DocumentChunk, Document).join(CurriculumSourceLink, CurriculumSourceLink.chunk_id == DocumentChunk.id)
+            .join(Document, Document.id == DocumentChunk.document_id)
+            .where(CurriculumSourceLink.knowledge_point_id == point.id, Document.status == "ready").limit(1)).first()
+        if not evidence: continue
+        chunk, document = evidence
+        citation = {"chunk_id": chunk.id, "document_id": document.id, "document_name": document.name,
+                    "locator": chunk.locator, "quote": chunk.content}
+        db.add(Question(assessment_id=assessment.id, knowledge_point_id=point.id, question_type=kinds[position % len(kinds)],
+            prompt=f"说明“{point.name}”的核心规则及适用前提。", answer=chunk.content,
+            explanation=f"依据《{document.name}》{chunk.locator}核对。", citations=[citation], position=position))
+    db.commit(); db.refresh(assessment)
+    if not db.scalar(select(func.count()).select_from(Question).where(Question.assessment_id == assessment.id)):
+        db.delete(assessment); db.commit(); raise HTTPException(409, "当前范围没有带有效引用的知识点，无法生成诊断")
+    return {"id": assessment.id, "status": assessment.status}
+
+
+@app.get("/api/assessments/{assessment_id}")
+def get_assessment(assessment_id: int, db: Session = Depends(get_db)):
+    assessment = db.get(Assessment, assessment_id)
+    if not assessment: raise HTTPException(404, "诊断不存在")
+    questions = db.scalars(select(Question).where(Question.assessment_id == assessment.id).order_by(Question.position)).all()
+    return {"id": assessment.id, "type": assessment.assessment_type, "status": assessment.status,
+            "questions": [{"id": q.id, "type": q.question_type, "prompt": q.prompt, "options": q.options,
+                           "answer": q.answer, "explanation": q.explanation, "citations": q.citations} for q in questions]}
+
+
+@app.post("/api/assessments/{assessment_id}/attempts")
+def submit_attempt(assessment_id: int, body: AttemptIn, db: Session = Depends(get_db)):
+    existing = db.scalar(select(QuestionAttempt).where(QuestionAttempt.assessment_id == assessment_id,
+                                                        QuestionAttempt.question_id == body.question_id))
+    if existing: return {"id": existing.id, "score": existing.score, "idempotent": True}
+    question = db.get(Question, body.question_id)
+    if not question or question.assessment_id != assessment_id: raise HTTPException(404, "题目不存在")
+    expected = set(question.answer); actual = set(body.response)
+    score = round(len(expected & actual) / max(1, len(expected)), 2)
+    attempt = QuestionAttempt(assessment_id=assessment_id, question_id=question.id, response=body.response,
+        score=score, self_rating=body.self_rating, duration_seconds=body.duration_seconds)
+    db.add(attempt); db.flush()
+    if question.knowledge_point_id:
+        point = db.get(KnowledgePoint, question.knowledge_point_id); before = point.mastery
+        delta = round((score * 12) + (body.self_rating - 3) * 2, 2); point.mastery = max(0, min(100, before + delta))
+        point.status = "mastered" if point.mastery >= 85 else "reviewing"
+        db.add(MasteryEvent(knowledge_point_id=point.id, source_type="assessment", source_id=attempt.id,
+                            delta=point.mastery - before, before_value=before, after_value=point.mastery))
+        if score < .6 and not db.scalar(select(ReviewItem).where(ReviewItem.knowledge_point_id == point.id)):
+            db.add(ReviewItem(knowledge_point_id=point.id, prompt=question.prompt, answer=question.answer,
+                              citations=question.citations, due_date=date.today()))
+    db.commit(); return {"id": attempt.id, "score": score, "idempotent": False}
+
+
+@app.get("/api/mastery/{point_id}")
+def mastery_history(point_id: int, db: Session = Depends(get_db)):
+    point = db.get(KnowledgePoint, point_id)
+    if not point: raise HTTPException(404, "知识点不存在")
+    events = db.scalars(select(MasteryEvent).where(MasteryEvent.knowledge_point_id == point_id).order_by(MasteryEvent.created_at)).all()
+    return {"knowledge_point_id": point_id, "mastery": point.mastery,
+            "events": [{"source_type": e.source_type, "source_id": e.source_id, "delta": e.delta,
+                        "before": e.before_value, "after": e.after_value, "created_at": e.created_at} for e in events]}
+
+
+@app.post("/api/questions/{question_id}/review", response_model=ReviewOut)
+def question_to_review(question_id: int, db: Session = Depends(get_db)):
+    question = db.get(Question, question_id)
+    if not question or not question.knowledge_point_id: raise HTTPException(404, "题目不存在或未绑定知识点")
+    existing = db.scalar(select(ReviewItem).where(ReviewItem.knowledge_point_id == question.knowledge_point_id))
+    if existing: return existing
+    row = ReviewItem(knowledge_point_id=question.knowledge_point_id, prompt=question.prompt,
+                     answer=question.answer, citations=question.citations, due_date=date.today())
+    db.add(row); db.commit(); db.refresh(row); return row
 
 
 @app.get("/api/settings/ai", response_model=AISettingOut)
@@ -500,7 +606,10 @@ def save_ai_setting(body: AISettingIn, db: Session = Depends(get_db)):
 def test_ai_setting(db: Session = Depends(get_db)):
     row = db.get(AIProviderSetting, 1)
     if not row or not row.encrypted_key: raise HTTPException(400, "尚未配置 API Key")
-    key = settings.fernet().decrypt(row.encrypted_key.encode()).decode()
+    key, migrated = settings.decrypt_secret(row.encrypted_key)
+    if migrated:
+        row.encrypted_key = migrated
+        db.commit()
     try:
         response = httpx.get(f"{settings.deepseek_base_url.rstrip('/')}/models", headers={"Authorization": f"Bearer {key}"}, timeout=15)
         response.raise_for_status()
@@ -523,9 +632,61 @@ def save_session(body: SessionIn, db: Session = Depends(get_db)):
     return {"id": row.id, "studied_at": row.studied_at}
 
 
+@app.post("/api/snapshots")
+def create_snapshot(body: SessionIn, db: Session = Depends(get_db)):
+    points = db.scalars(select(KnowledgePoint).join(Chapter).where(Chapter.subject_id == body.subject_id)).all() if body.subject_id else []
+    weak = sorted(points, key=lambda point: point.mastery)[:5]
+    row = LearningSnapshot(subject_id=body.subject_id, chapter_id=body.chapter_id,
+        goal=str(body.context.get("goal", "")), progress={"mastery": round(sum(p.mastery for p in points) / max(1, len(points)))},
+        weak_points=[{"id": p.id, "name": p.name, "mastery": p.mastery} for p in weak],
+        next_steps=["完成到期复习", "继续最近章节研讨"], context=body.context)
+    db.add(row); db.commit(); db.refresh(row); return {"id": row.id, "created_at": row.created_at}
+
+
+@app.get("/api/snapshots/latest")
+def latest_snapshot(subject_id: int | None = None, db: Session = Depends(get_db)):
+    stmt = select(LearningSnapshot).order_by(LearningSnapshot.created_at.desc())
+    if subject_id: stmt = stmt.where(LearningSnapshot.subject_id == subject_id)
+    row = db.scalar(stmt.limit(1))
+    if not row: raise HTTPException(404, "暂无学习快照")
+    return {"id": row.id, "subject_id": row.subject_id, "chapter_id": row.chapter_id, "goal": row.goal,
+            "progress": row.progress, "weak_points": row.weak_points, "next_steps": row.next_steps,
+            "context": row.context, "created_at": row.created_at}
+
+
+@app.post("/api/backups")
+def create_backup():
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    work = settings.backup_dir / f"backup-{stamp}"
+    work.mkdir()
+    database_url = settings.database_url.replace("postgresql+psycopg://", "postgresql://")
+    subprocess.run(["pg_dump", database_url, "--file", str(work / "database.sql")], check=True)
+    manifest = {"version": 2, "created_at": stamp, "includes": ["database.sql", "uploads", ".master.key"]}
+    (work / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False), encoding="utf-8")
+    archive = settings.backup_dir / f"caiwu-{stamp}.tar.gz"
+    with tarfile.open(archive, "w:gz") as bundle:
+        bundle.add(work / "database.sql", arcname="database.sql"); bundle.add(work / "manifest.json", arcname="manifest.json")
+        if settings.storage_dir.exists(): bundle.add(settings.storage_dir, arcname="uploads")
+    import shutil
+    shutil.rmtree(work)
+    return {"name": archive.name, "size": archive.stat().st_size}
+
+
+@app.get("/api/backups")
+def list_backups():
+    settings.backup_dir.mkdir(parents=True, exist_ok=True)
+    return [{"name": path.name, "size": path.stat().st_size} for path in sorted(settings.backup_dir.glob("caiwu-*.tar.gz"), reverse=True)]
+
+
 @app.get("/api/dashboard")
-def dashboard(db: Session = Depends(get_db)):
-    points = db.scalars(select(KnowledgePoint)).all()
+def dashboard(subject_id: int | None = None, db: Session = Depends(get_db)):
+    point_stmt = select(KnowledgePoint).join(Chapter).where(
+        KnowledgePoint.archived.is_(False), KnowledgePoint.name != "上传资料后编辑知识点",
+    )
+    if subject_id:
+        point_stmt = point_stmt.where(Chapter.subject_id == subject_id)
+    points = db.scalars(point_stmt).all()
     reviews = db.scalar(select(func.count()).select_from(ReviewItem).where(ReviewItem.due_date <= date.today())) or 0
     documents = db.scalar(select(func.count()).select_from(Document).where(Document.status == "ready")) or 0
     notes_count = db.scalar(select(func.count()).select_from(Note)) or 0
@@ -537,4 +698,5 @@ def dashboard(db: Session = Depends(get_db)):
     return {"review_due": reviews, "documents": documents, "notes": notes_count, "streak": streak,
             "progress": round(sum(p.mastery for p in points) / max(1, len(points))),
             "weak_points": [{"id": p.id, "name": p.name, "mastery": p.mastery} for p in weak],
-            "recent_session": {"route": recent.route, "context": recent.context} if recent else None}
+            "recent_session": {"route": recent.route, "subject_id": recent.subject_id,
+                               "chapter_id": recent.chapter_id, "context": recent.context} if recent else None}

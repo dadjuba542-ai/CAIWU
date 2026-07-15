@@ -9,4 +9,5 @@ export type Citation = { chunk_id: number; document_id: number; document_name: s
 export type ChatAnswer = { conversation_id: number; answer: string; citations: Citation[]; reasoning_type: string; grounded: boolean; insufficient_evidence: string[]; suggested_materials: string[]; follow_up_questions: string[] };
 export type Note = { id: number; title: string; content: string; tags: string[]; favorite: boolean; updated_at: string };
 export type Review = { id: number; knowledge_point_id: number; prompt: string; answer: string; citations: Citation[]; due_date: string; interval_days: number; attempts: number };
-export type Dashboard = { review_due: number; documents: number; notes: number; streak: number; progress: number; weak_points: Point[]; recent_session?: { route: string; context: Record<string, unknown> } };
+export type Dashboard = { review_due: number; documents: number; notes: number; streak: number; progress: number; weak_points: Point[]; recent_session?: { route: string; subject_id?: number; chapter_id?: number; context: { conversation_id?: number } } };
+export type Assessment = { id: number; type: string; status: string; questions: { id: number; type: string; prompt: string; options: string[]; answer: string; explanation: string; citations: Citation[] }[] };

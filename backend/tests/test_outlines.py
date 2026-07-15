@@ -41,6 +41,28 @@ def test_pdf_bookmarks_are_preferred(tmp_path: Path):
     ]
 
 
+def test_mechanical_docx_outline_links_heading_body_until_next_section(tmp_path: Path):
+    path = tmp_path / "income.docx"
+    docx = DocxDocument()
+    docx.add_heading("收入", level=1)
+    docx.add_paragraph("收入章节总述。")
+    docx.add_heading("收入确认", level=2)
+    docx.add_paragraph("确认条件正文。")
+    docx.add_heading("金融资产", level=1)
+    docx.save(path)
+    document = Document(name="讲义", original_name=path.name, path=str(path), mime_type="application/docx")
+    chunks = [
+        DocumentChunk(id=1, document_id=1, content="收入", locator="第 1 段", position=0, embedding=[]),
+        DocumentChunk(id=2, document_id=1, content="收入章节总述。", locator="第 2 段", position=1, embedding=[]),
+        DocumentChunk(id=3, document_id=1, content="收入确认", locator="第 3 段", position=2, embedding=[]),
+        DocumentChunk(id=4, document_id=1, content="确认条件正文。", locator="第 4 段", position=3, embedding=[]),
+        DocumentChunk(id=5, document_id=1, content="金融资产", locator="第 5 段", position=4, embedding=[]),
+    ]
+    tree = outlines.mechanical_tree(document, chunks)
+    assert tree[0]["source_chunk_ids"] == [1, 2, 3, 4]
+    assert tree[0]["points"][0]["source_chunk_ids"] == [3, 4]
+
+
 def test_proposal_merge_and_confirm_preserve_mastery(tmp_path: Path, monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -76,5 +98,5 @@ def test_proposal_merge_and_confirm_preserve_mastery(tmp_path: Path, monkeypatch
     result = confirm_outline_proposal(proposal.id, db)
     assert result["ok"] is True
     assert db.get(KnowledgePoint, point.id).mastery == 72
-    assert db.scalar(select(func.count()).select_from(CurriculumSourceLink)) == 2
+    assert db.scalar(select(func.count()).select_from(CurriculumSourceLink)) == 3
     assert confirm_outline_proposal(proposal.id, db)["idempotent"] is True

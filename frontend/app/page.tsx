@@ -8,9 +8,9 @@ import {
   Search, Send, Settings, ShieldCheck, Sparkles, Star, Target, Upload, WandSparkles, X,
 } from "lucide-react";
 import { api } from "@/lib/api";
-import type { Chapter, ChatAnswer, Citation, Dashboard, Doc, Exam, Note, OutlineProposal, Point, ProposalNode, Review, Subject } from "@/lib/types";
+import type { Assessment, Chapter, ChatAnswer, Citation, Dashboard, Doc, Exam, Note, OutlineProposal, Point, ProposalNode, Review, Subject } from "@/lib/types";
 
-type View = "dashboard" | "curriculum" | "library" | "study" | "notes" | "review" | "settings";
+type View = "dashboard" | "curriculum" | "library" | "study" | "assessment" | "notes" | "review" | "settings";
 type Toast = { message: string; tone: "ok" | "error" } | null;
 
 const nav: { id: View; label: string; icon: typeof BookOpenText }[] = [
@@ -18,6 +18,7 @@ const nav: { id: View; label: string; icon: typeof BookOpenText }[] = [
   { id: "curriculum", label: "课程目录", icon: FolderTree },
   { id: "library", label: "资料库", icon: Library },
   { id: "study", label: "AI 研讨", icon: MessageSquareText },
+  { id: "assessment", label: "诊断测验", icon: GraduationCap },
   { id: "notes", label: "笔记簿", icon: NotebookPen },
   { id: "review", label: "复习队列", icon: BrainCircuit },
 ];
@@ -34,6 +35,7 @@ export default function Home() {
   const [reviews, setReviews] = useState<Review[]>([]);
   const [selectedSubject, setSelectedSubject] = useState<number | undefined>();
   const [selectedChapter, setSelectedChapter] = useState<number | undefined>();
+  const [resumeConversation, setResumeConversation] = useState<number | undefined>();
   const [reader, setReader] = useState<{ citation: Citation; content: string } | null>(null);
   const [toast, setToast] = useState<Toast>(null);
   const [loading, setLoading] = useState(true);
@@ -45,7 +47,7 @@ export default function Home() {
   const refresh = useCallback(async () => {
     try {
       const [tree, documents, dash, noteRows, reviewRows] = await Promise.all([
-        api<Exam[]>("/api/curriculum"), api<Doc[]>("/api/documents"), api<Dashboard>("/api/dashboard"),
+        api<Exam[]>("/api/curriculum"), api<Doc[]>("/api/documents"), api<Dashboard>(`/api/dashboard${selectedSubject ? `?subject_id=${selectedSubject}` : ""}`),
         api<Note[]>("/api/notes"), api<Review[]>("/api/reviews/today"),
       ]);
       setExams(tree); setDocs(documents); setDashboard(dash); setNotes(noteRows); setReviews(reviewRows);
@@ -63,10 +65,24 @@ export default function Home() {
     try {
       const data = await api<{ chunks: { content: string }[] }>(`/api/documents/${citation.document_id}/chunks?locator=${encodeURIComponent(citation.locator)}`);
       setReader({ citation, content: data.chunks.map(item => item.content).join("\n\n") || citation.quote });
-    } catch (error) { flash(error instanceof Error ? error.message : "原文已不可用", "error"); }
+    } catch (error) {
+      if (error instanceof Error && error.message.includes("资料不存在")) {
+        setReader({ citation, content: `${citation.quote}\n\n（原资料已删除，以上为回答生成时保存的引用快照。）` });
+        flash("原资料已删除，正在显示历史引用快照", "error");
+      } else {
+        flash(error instanceof Error ? error.message : "原文暂时不可用", "error");
+      }
+    }
   }
 
   function go(next: View) { setView(next); setMobileOpen(false); }
+  function resumeStudy() {
+    const recent = dashboard?.recent_session;
+    if (recent?.subject_id) setSelectedSubject(recent.subject_id);
+    setSelectedChapter(recent?.chapter_id);
+    setResumeConversation(recent?.context.conversation_id);
+    go("study");
+  }
 
   return (
     <main className="app-shell">
@@ -82,7 +98,7 @@ export default function Home() {
           {nav.map(item => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><item.icon size={19} /><span>{item.label}</span>{item.id === "review" && reviews.length > 0 && <b>{reviews.length}</b>}</button>)}
         </nav>
         <div className="sidebar-foot">
-          <div className="focus-card"><Target size={18} /><div><span>当前目标</span><strong>CPA · 税法</strong></div><small>{dashboard?.progress ?? 0}%</small></div>
+          <div className="focus-card"><Target size={18} /><div><span>当前目标</span><strong>{subject?.name || "选择学习科目"}</strong></div><small>{dashboard?.progress ?? 0}%</small></div>
           <button className={view === "settings" ? "settings active" : "settings"} onClick={() => go("settings")}><Settings size={18} />系统设置</button>
           <div className="grounded"><ShieldCheck size={15} />仅依据你的资料回答</div>
         </div>
@@ -96,10 +112,11 @@ export default function Home() {
         </header>
 
         <div className="page-wrap" key={view}>
-          {view === "dashboard" && <DashboardView data={dashboard} notes={notes} docs={docs} onGo={go} />}
-          {view === "curriculum" && <CurriculumView exams={exams} onRefresh={refresh} flash={flash} onStudy={(s, c) => { setSelectedSubject(s); setSelectedChapter(c); go("study"); }} />}
+          {view === "dashboard" && <DashboardView data={dashboard} notes={notes} docs={docs} onGo={go} onResume={resumeStudy} />}
+          {view === "curriculum" && <CurriculumView exams={exams} onRefresh={refresh} flash={flash} onStudy={(s, c) => { setSelectedSubject(s); setSelectedChapter(c); setResumeConversation(undefined); go("study"); }} onReview={async pointId => { try { await api(`/api/reviews/from-point/${pointId}`, { method: "POST" }); await refresh(); go("review"); } catch (e) { flash((e as Error).message, "error"); } }} />}
           {view === "library" && <LibraryView docs={docs} exams={exams} onRefresh={refresh} flash={flash} />}
-          {view === "study" && <StudyView exams={exams} subject={subject} chapter={chapter} subjectId={selectedSubject} chapterId={selectedChapter} setSubject={setSelectedSubject} setChapter={setSelectedChapter} onCitation={openCitation} flash={flash} />}
+          {view === "study" && <StudyView exams={exams} subject={subject} chapter={chapter} subjectId={selectedSubject} chapterId={selectedChapter} initialConversationId={resumeConversation} setSubject={setSelectedSubject} setChapter={setSelectedChapter} onCitation={openCitation} flash={flash} />}
+          {view === "assessment" && <AssessmentView subjectId={selectedSubject} chapterId={selectedChapter} onCitation={openCitation} flash={flash} />}
           {view === "notes" && <NotesView notes={notes} onRefresh={refresh} flash={flash} />}
           {view === "review" && <ReviewView reviews={reviews} onRefresh={refresh} flash={flash} />}
           {view === "settings" && <SettingsView flash={flash} />}
@@ -115,9 +132,9 @@ function PageTitle({ eyebrow, title, copy, action }: { eyebrow: string; title: s
   return <div className="page-title"><div><span>{eyebrow}</span><h1>{title}</h1><p>{copy}</p></div>{action}</div>;
 }
 
-function DashboardView({ data, notes, docs, onGo }: { data: Dashboard | null; notes: Note[]; docs: Doc[]; onGo: (view: View) => void }) {
+function DashboardView({ data, notes, docs, onGo, onResume }: { data: Dashboard | null; notes: Note[]; docs: Doc[]; onGo: (view: View) => void; onResume: () => void }) {
   return <>
-    <PageTitle eyebrow="GOOD MORNING · 今日计划" title="把零散知识，磨成你的判断力。" copy="从上次停下的地方继续。所有进度来自真实学习记录。" action={<button className="primary" onClick={() => onGo("study")}>继续研习 <ArrowRight size={17} /></button>} />
+    <PageTitle eyebrow="GOOD MORNING · 今日计划" title="把零散知识，磨成你的判断力。" copy="从上次停下的地方继续。所有进度来自真实学习记录。" action={<button className="primary" onClick={onResume}>继续研习 <ArrowRight size={17} /></button>} />
     <div className="metric-grid">
       <article className="metric hero-metric"><div className="metric-icon"><Flame /></div><span>连续研习</span><strong>{data?.streak ?? 0}<small> 天</small></strong><p>今天完成一次研习即可续上记录</p></article>
       <article className="metric"><span>今日待复习</span><strong>{data?.review_due ?? 0}<small> 项</small></strong><button onClick={() => onGo("review")}>进入队列 <ArrowRight size={14} /></button></article>
@@ -127,7 +144,7 @@ function DashboardView({ data, notes, docs, onGo }: { data: Dashboard | null; no
     <div className="dashboard-grid">
       <article className="paper-card continue-card">
         <div className="card-head"><div><span className="kicker">CONTINUE</span><h2>续上你的学习现场</h2></div><Clock3 size={20} /></div>
-        <div className="study-ticket"><div className="ticket-index">01</div><div><span>最近学习</span><h3>{data?.recent_session ? "恢复上次研习现场" : "从一门科目开始"}</h3><p>{data?.recent_session ? "你的上下文、资料范围和学习位置都已保存。" : "选择科目并上传资料，建立第一段可追踪的学习记录。"}</p></div><button onClick={() => onGo("study")}><ArrowRight /></button></div>
+        <div className="study-ticket"><div className="ticket-index">01</div><div><span>最近学习</span><h3>{data?.recent_session ? "恢复上次研习现场" : "从一门科目开始"}</h3><p>{data?.recent_session ? "你的会话、资料范围和章节位置都已保存。" : "选择科目并上传资料，建立第一段可追踪的学习记录。"}</p></div><button onClick={onResume}><ArrowRight /></button></div>
       </article>
       <article className="paper-card weak-card"><div className="card-head"><div><span className="kicker red">FOCUS</span><h2>薄弱知识点</h2></div><Highlighter size={20} /></div><div className="weak-list">{data?.weak_points?.slice(0, 4).map((point, i) => <div key={point.id}><b>0{i + 1}</b><span>{point.name}</span><em>{Math.round(point.mastery)}%</em></div>) || <p className="empty">完成诊断后显示薄弱项</p>}</div></article>
     </div>
@@ -138,14 +155,14 @@ function DashboardView({ data, notes, docs, onGo }: { data: Dashboard | null; no
   </>;
 }
 
-function CurriculumView({ exams, onRefresh, flash, onStudy }: { exams: Exam[]; onRefresh: () => void; flash: (m: string, t?: "ok" | "error") => void; onStudy: (s: number, c: number) => void }) {
+function CurriculumView({ exams, onRefresh, flash, onStudy, onReview }: { exams: Exam[]; onRefresh: () => void; flash: (m: string, t?: "ok" | "error") => void; onStudy: (s: number, c: number) => void; onReview: (pointId: number) => void }) {
   const [openExam, setOpenExam] = useState<number | null>(exams[0]?.id ?? null);
   const [openSubject, setOpenSubject] = useState<number | null>(null);
   const [newName, setNewName] = useState("");
   async function addChapter(subjectId: number) { if (!newName.trim()) return; try { await api("/api/curriculum/chapters", { method: "POST", body: JSON.stringify({ parent_id: subjectId, name: newName }) }); setNewName(""); onRefresh(); flash("章节已加入目录"); } catch (e) { flash((e as Error).message, "error"); } }
   return <><PageTitle eyebrow="CURRICULUM · 可编辑知识树" title="课程目录" copy="考试、科目、章节、知识点各司其职。资料可以换，学习路径不能乱。" />
-    <div className="curriculum-layout"><div className="tree-panel">{exams.map(exam => <section key={exam.id} className="exam-block"><button className="exam-title" onClick={() => setOpenExam(openExam === exam.id ? null : exam.id)}><span className="exam-code">{exam.code}</span><div><strong>{exam.name}</strong><small>{exam.subjects.length} 门科目</small></div>{openExam === exam.id ? <ChevronDown /> : <ChevronRight />}</button>{openExam === exam.id && <div className="subject-list">{exam.subjects.map(sub => <div key={sub.id} className="subject-node"><button onClick={() => setOpenSubject(openSubject === sub.id ? null : sub.id)}><BookMarked size={17} /><span>{sub.name}</span><em>{sub.chapters.length}章</em>{openSubject === sub.id ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</button>{openSubject === sub.id && <div className="chapter-list">{sub.chapters.map(ch => <div className="chapter-node" key={ch.id}><div><span>{String(ch.position + 1).padStart(2, "0")}</span><strong>{ch.name}</strong><button onClick={() => onStudy(sub.id, ch.id)}>研习</button></div>{ch.points.map(p => <div className="point-node" key={p.id}><Circle size={9} fill={p.status === "mastered" ? "currentColor" : "none"} /><span>{p.name}</span><small>{statusLabel[p.status]}</small><div><i style={{ width: `${p.mastery}%` }} /></div></div>)}</div>)}<div className="inline-add"><input value={newName} onChange={e => setNewName(e.target.value)} placeholder="新增章节名称" /><button onClick={() => addChapter(sub.id)}><Plus size={15} /></button></div></div>}</div>)}</div>}</section>)}</div>
-      <aside className="method-panel"><span className="kicker red">LEARNING LOGIC</span><h2>不是看完，<br />才叫学会。</h2><p>知识点的掌握度由诊断、答题和复习表现共同计算，不能手动点亮。</p><ol><li><b>01</b> 上传并绑定资料</li><li><b>02</b> 完成章节诊断</li><li><b>03</b> 进入苏格拉底研讨</li><li><b>04</b> 按复习队列巩固</li></ol></aside>
+    <div className="curriculum-layout"><div className="tree-panel">{exams.map(exam => <section key={exam.id} className="exam-block"><button className="exam-title" onClick={() => setOpenExam(openExam === exam.id ? null : exam.id)}><span className="exam-code">{exam.code}</span><div><strong>{exam.name}</strong><small>{exam.subjects.length} 门科目</small></div>{openExam === exam.id ? <ChevronDown /> : <ChevronRight />}</button>{openExam === exam.id && <div className="subject-list">{exam.subjects.map(sub => <div key={sub.id} className="subject-node"><button onClick={() => setOpenSubject(openSubject === sub.id ? null : sub.id)}><BookMarked size={17} /><span>{sub.name}</span><em>{sub.chapters.length}章</em>{openSubject === sub.id ? <ChevronDown size={16} /> : <ChevronRight size={16} />}</button>{openSubject === sub.id && <div className="chapter-list">{sub.chapters.map(ch => <div className="chapter-node" key={ch.id}><div><span>{String(ch.position + 1).padStart(2, "0")}</span><strong>{ch.name}</strong><button onClick={() => onStudy(sub.id, ch.id)}>研习</button></div>{ch.points.map(p => <div className="point-node" key={p.id}><Circle size={9} fill={p.status === "mastered" ? "currentColor" : "none"} /><span>{p.name}</span><small>{statusLabel[p.status]}</small><div><i style={{ width: `${p.mastery}%` }} /></div><button className="point-review" onClick={() => onReview(p.id)}>加入复习</button></div>)}</div>)}<div className="inline-add"><input value={newName} onChange={e => setNewName(e.target.value)} placeholder="新增章节名称" /><button onClick={() => addChapter(sub.id)}><Plus size={15} /></button></div></div>}</div>)}</div>}</section>)}</div>
+      <aside className="method-panel"><span className="kicker red">LEARNING LOGIC</span><h2>不是看完，<br />才叫学会。</h2><p>知识点掌握度由有据研讨和复习表现推进，不能手动点亮。</p><ol><li><b>01</b> 上传并绑定资料</li><li><b>02</b> 核对自动目录</li><li><b>03</b> 进入苏格拉底研讨</li><li><b>04</b> 按复习队列巩固</li></ol></aside>
     </div></>;
 }
 
@@ -189,8 +206,17 @@ function OutlineStudio({ document, initial, onClose, onChange, flash }: { docume
 
 function Confidence({ value }: { value: number }) { const percent = Math.round(value * 100); return <span className={`confidence ${percent < 60 ? "low" : percent < 80 ? "medium" : "high"}`}>{percent}%</span>; }
 
-function StudyView({ exams, subject, chapter, subjectId, chapterId, setSubject, setChapter, onCitation, flash }: { exams: Exam[]; subject?: Subject; chapter?: Chapter; subjectId?: number; chapterId?: number; setSubject: (id: number) => void; setChapter: (id?: number) => void; onCitation: (c: Citation) => void; flash: (m: string, t?: "ok" | "error") => void }) {
-  const [question, setQuestion] = useState(""); const [mode, setMode] = useState("answer"); const [asking, setAsking] = useState(false); const [conversationId, setConversationId] = useState<number>(); const [messages, setMessages] = useState<{ role: string; text: string; answer?: ChatAnswer }[]>([]);
+function StudyView({ exams, subject, chapter, subjectId, chapterId, initialConversationId, setSubject, setChapter, onCitation, flash }: { exams: Exam[]; subject?: Subject; chapter?: Chapter; subjectId?: number; chapterId?: number; initialConversationId?: number; setSubject: (id: number) => void; setChapter: (id?: number) => void; onCitation: (c: Citation) => void; flash: (m: string, t?: "ok" | "error") => void }) {
+  const [question, setQuestion] = useState(""); const [mode, setMode] = useState("answer"); const [asking, setAsking] = useState(false); const [conversationId, setConversationId] = useState<number>(); const [messages, setMessages] = useState<{ role: string; text: string; answer?: ChatAnswer }[]>([]); const loadedConversation = useRef<number | undefined>(undefined); const draftLoaded = useRef(false);
+  useEffect(() => { setQuestion(window.localStorage.getItem("study-question-draft") || ""); draftLoaded.current = true; }, []);
+  useEffect(() => { if (draftLoaded.current) window.localStorage.setItem("study-question-draft", question); }, [question]);
+  useEffect(() => {
+    if (!initialConversationId || loadedConversation.current === initialConversationId) return;
+    loadedConversation.current = initialConversationId;
+    api<{ id: number; mode: string; messages: { role: string; content: string; payload?: ChatAnswer }[] }>(`/api/conversations/${initialConversationId}`)
+      .then(saved => { setConversationId(saved.id); setMode(saved.mode); setMessages(saved.messages.map(message => ({ role: message.role, text: message.content, answer: message.role === "assistant" ? message.payload : undefined }))); })
+      .catch(error => flash(error instanceof Error ? error.message : "无法恢复会话", "error"));
+  }, [initialConversationId, flash]);
   async function ask() { if (!question.trim() || asking) return; const prompt = question; setQuestion(""); setMessages(m => [...m, { role: "user", text: prompt }]); setAsking(true); try { const result = await api<ChatAnswer>("/api/ai/ask", { method: "POST", body: JSON.stringify({ question: prompt, conversation_id: conversationId, subject_id: subjectId, chapter_id: chapterId, mode }) }); setConversationId(result.conversation_id); setMessages(m => [...m, { role: "assistant", text: result.answer, answer: result }]); await api("/api/sessions", { method: "POST", body: JSON.stringify({ subject_id: subjectId, chapter_id: chapterId, route: "study", context: { conversation_id: result.conversation_id } }) }); } catch (e) { flash((e as Error).message, "error"); setMessages(m => [...m, { role: "error", text: (e as Error).message }]); } finally { setAsking(false); } }
   return <><PageTitle eyebrow="GROUNDED STUDY · 有据研讨" title="AI 研讨室" copy="先限定科目与章节，再提问。回答中的每个关键结论都能回到原文。" />
     <div className="study-layout"><aside className="context-rail"><span className="kicker">STUDY SCOPE</span><h3>本次研习范围</h3><label>科目<select value={subjectId} onChange={e => { setSubject(Number(e.target.value)); setChapter(undefined); }}>{exams.flatMap(e => e.subjects).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}</select></label><label>章节<select value={chapterId || ""} onChange={e => setChapter(e.target.value ? Number(e.target.value) : undefined)}><option value="">全部章节</option>{subject?.chapters.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}</select></label><div className="scope-rule"><ShieldCheck /><p><strong>严格资料约束</strong><span>没有依据，宁可拒答。</span></p></div><div className="study-modes"><button className={mode === "answer" ? "active" : ""} onClick={() => setMode("answer")}><Sparkles />精讲模式</button><button className={mode === "socratic" ? "active" : ""} onClick={() => setMode("socratic")}><BrainCircuit />苏格拉底</button></div></aside>
@@ -198,11 +224,18 @@ function StudyView({ exams, subject, chapter, subjectId, chapterId, setSubject, 
     </div></>;
 }
 
+function AssessmentView({ subjectId, chapterId, onCitation, flash }: { subjectId?: number; chapterId?: number; onCitation: (c: Citation) => void; flash: (m: string, t?: "ok" | "error") => void }) {
+  const [assessment, setAssessment] = useState<Assessment | null>(null); const [answers, setAnswers] = useState<Record<number, string>>({}); const [scores, setScores] = useState<Record<number, number>>({}); const [busy, setBusy] = useState(false);
+  async function create() { if (!subjectId) return flash("请先在课程或研讨页选择科目", "error"); setBusy(true); try { const row = await api<{ id: number }>("/api/assessments", { method: "POST", body: JSON.stringify({ subject_id: subjectId, chapter_id: chapterId, question_count: 5 }) }); setAssessment(await api<Assessment>(`/api/assessments/${row.id}`)); } catch (e) { flash((e as Error).message, "error"); } finally { setBusy(false); } }
+  async function submit(questionId: number) { try { const result = await api<{ score: number }>(`/api/assessments/${assessment?.id}/attempts`, { method: "POST", body: JSON.stringify({ question_id: questionId, response: answers[questionId] || "", self_rating: 3, duration_seconds: 0 }) }); setScores(value => ({ ...value, [questionId]: result.score })); flash("作答已记录并更新掌握度"); } catch (e) { flash((e as Error).message, "error"); } }
+  return <><PageTitle eyebrow="DIAGNOSTIC · 有据诊断" title="章节诊断" copy="每道题都来自已绑定资料，答错后直接进入复习闭环。" action={<button className="primary" disabled={busy} onClick={create}>{busy && <LoaderCircle className="spin" />}生成诊断</button>} /><div className="assessment-list">{assessment?.questions.map((question, index) => <article className="paper-card" key={question.id}><span className="kicker">QUESTION {index + 1} · {question.type}</span><h2>{question.prompt}</h2><textarea value={answers[question.id] || ""} onChange={e => setAnswers(value => ({ ...value, [question.id]: e.target.value }))} placeholder="写下你的答案" /><div><button className="primary" onClick={() => submit(question.id)}>提交答案</button>{scores[question.id] !== undefined && <strong>得分 {Math.round(scores[question.id] * 100)}%</strong>}</div>{scores[question.id] !== undefined && <section><p>{question.explanation}</p>{question.citations.map(c => <button key={c.chunk_id} onClick={() => onCitation(c)}>{c.document_name} · {c.locator}</button>)}</section>}</article>)}{!assessment && <div className="table-empty"><GraduationCap /><strong>尚未生成诊断</strong><span>先确认资料目录，再开始章节诊断。</span></div>}</div></>;
+}
+
 function NotesView({ notes, onRefresh, flash }: { notes: Note[]; onRefresh: () => void; flash: (m: string, t?: "ok" | "error") => void }) {
-  const [selected, setSelected] = useState<Note | null>(notes[0] || null); const [title, setTitle] = useState(""); const [content, setContent] = useState(""); const [search, setSearch] = useState("");
+  const [selected, setSelected] = useState<Note | null>(notes[0] || null); const [title, setTitle] = useState(""); const [content, setContent] = useState(""); const [search, setSearch] = useState(""); const saving = useRef(false);
   useEffect(() => { if (selected) { setTitle(selected.title); setContent(selected.content); } }, [selected]);
   const shown = notes.filter(n => `${n.title}${n.content}`.includes(search));
-  async function save() { if (!title.trim()) return; const body = { title, content, tags: selected?.tags || [], favorite: selected?.favorite || false }; try { if (selected) await api(`/api/notes/${selected.id}`, { method: "PUT", body: JSON.stringify(body) }); else await api("/api/notes", { method: "POST", body: JSON.stringify(body) }); flash("笔记已存档"); onRefresh(); } catch (e) { flash((e as Error).message, "error"); } }
+  async function save() { if (!title.trim() || saving.current) return; saving.current = true; const body = { title, content, tags: selected?.tags || [], favorite: selected?.favorite || false }; try { const saved = selected ? await api<Note>(`/api/notes/${selected.id}`, { method: "PUT", body: JSON.stringify(body) }) : await api<Note>("/api/notes", { method: "POST", body: JSON.stringify(body) }); setSelected(saved); flash("笔记已存档"); await onRefresh(); } catch (e) { flash((e as Error).message, "error"); } finally { saving.current = false; } }
   function fresh() { setSelected(null); setTitle("未命名笔记"); setContent(""); }
   return <><PageTitle eyebrow="NOTEBOOK · 双向笔记" title="笔记簿" copy="把结论、疑问和原文证据放在一起，别让笔记沦为复制粘贴坟场。" action={<button className="primary" onClick={fresh}><Plus />新建笔记</button>} /><div className="notes-layout"><aside className="note-index"><div className="searchbox"><Search /><input value={search} onChange={e => setSearch(e.target.value)} placeholder="搜索笔记" /></div>{shown.map(note => <button key={note.id} className={selected?.id === note.id ? "active" : ""} onClick={() => setSelected(note)}><div><strong>{note.title}</strong>{note.favorite && <Star size={13} fill="currentColor" />}</div><p>{note.content.slice(0, 55) || "空白笔记"}</p><span>{new Date(note.updated_at).toLocaleDateString("zh-CN")}</span></button>)}{shown.length === 0 && <div className="mini-empty">没有匹配的笔记</div>}</aside><section className="note-editor"><div className="editor-tools"><span>MARKDOWN</span><div><button onClick={() => setContent(c => c + "\n## 小结\n")}>H2</button><button onClick={() => setContent(c => c + "\n- 要点\n")}>•</button><button onClick={save} className="save-note">保存</button></div></div><input className="note-title-input" value={title} onChange={e => setTitle(e.target.value)} placeholder="笔记标题" /><textarea value={content} onChange={e => setContent(e.target.value)} onBlur={() => title && save()} placeholder="写下你的理解、疑问和证据…\n\n支持 Markdown。离开编辑框时自动保存。" /><div className="editor-foot"><span><Clock3 />自动保存已启用</span><span>{content.length} 字</span></div></section></div></>;
 }

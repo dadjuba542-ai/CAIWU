@@ -19,13 +19,37 @@ services:
       DATABASE_URL: postgresql+psycopg://ledger:ledger@db:5432/ledger
       APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
       STORAGE_DIR: /data/uploads
-      CORS_ORIGINS: http://localhost:3000
+      CORS_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
+      MAX_UPLOAD_BYTES: ${MAX_UPLOAD_BYTES:-52428800}
+      EMBEDDING_CACHE_DIR: /data/models
     volumes:
       - upload_data:/data/uploads
+      - model_cache:/data/models
+      - backup_data:/data/backups
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker:
+    build: ./backend
+    command: ["python", "-m", "app.worker"]
+    environment:
+      DATABASE_URL: postgresql+psycopg://ledger:ledger@db:5432/ledger
+      APP_ENCRYPTION_KEY: ${APP_ENCRYPTION_KEY:-}
+      STORAGE_DIR: /data/uploads
+      EMBEDDING_CACHE_DIR: /data/models
+    volumes:
+      - upload_data:/data/uploads
+      - model_cache:/data/models
+    depends_on:
+      api:
         condition: service_healthy
 
   web:
@@ -36,10 +60,12 @@ services:
     environment:
       NEXT_PUBLIC_API_URL: http://localhost:8000
     ports:
-      - "3000:3000"
+      - "127.0.0.1:3000:3000"
     depends_on:
       - api
 
 volumes:
   postgres_data:
   upload_data:
+  model_cache:
+  backup_data:

@@ -61,6 +61,7 @@ class DocumentOut(ORMModel):
     subject_id: int | None
     chapter_id: int | None
     created_at: datetime
+    job_id: int | None = None
 
 
 class DocumentUpdate(BaseModel):
@@ -136,6 +137,20 @@ class ReviewOut(ORMModel):
 
 class ReviewResult(BaseModel):
     quality: int = Field(ge=0, le=5)
+
+
+class AssessmentCreate(BaseModel):
+    subject_id: int
+    chapter_id: int | None = None
+    assessment_type: str = "diagnostic"
+    question_count: int = Field(default=5, ge=1, le=20)
+
+
+class AttemptIn(BaseModel):
+    question_id: int
+    response: str
+    self_rating: int = Field(default=3, ge=1, le=5)
+    duration_seconds: int = Field(default=0, ge=0, le=86400)
 
 
 class AISettingIn(BaseModel):

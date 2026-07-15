@@ -17,13 +17,24 @@ def retrieve(db: Session, question: str, subject_id: int | None, chapter_id: int
     if chapter_id:
         linked_chunks = select(CurriculumSourceLink.chunk_id).where(CurriculumSourceLink.chapter_id == chapter_id)
         stmt = stmt.where((Document.chapter_id == chapter_id) | (DocumentChunk.id.in_(linked_chunks)))
-    query_vec = embed(question)
     query_tokens = set(tokenize(question))
     ranked = []
-    for chunk, document in db.execute(stmt).all():
-        lexical = len(query_tokens.intersection(tokenize(chunk.content))) / max(1, len(query_tokens))
-        score = cosine(query_vec, chunk.embedding) * 0.65 + lexical * 0.35
-        ranked.append((score, chunk, document))
+    if db.bind and db.bind.dialect.name == "postgresql":
+        from .embeddings import semantic_embed
+        query_vec = semantic_embed(question)
+        distance = DocumentChunk.vector.cosine_distance(query_vec).label("distance")
+        rows = db.execute(stmt.add_columns(distance).where(DocumentChunk.vector.is_not(None)).order_by(distance).limit(30)).all()
+        for chunk, document, vector_distance in rows:
+            lexical = len(query_tokens.intersection(tokenize(chunk.content))) / max(1, len(query_tokens))
+            score = (1 - float(vector_distance)) * 0.72 + lexical * 0.28
+            ranked.append((score, chunk, document))
+    else:
+        query_vec = embed(question)
+        rows = db.execute(stmt.limit(2000)).all()
+        for chunk, document in rows:
+            lexical = len(query_tokens.intersection(tokenize(chunk.content))) / max(1, len(query_tokens))
+            score = cosine(query_vec, chunk.embedding) * 0.65 + lexical * 0.35
+            ranked.append((score, chunk, document))
     ranked.sort(key=lambda item: item[0], reverse=True)
     return [item for item in ranked[:limit] if item[0] >= 0.08]
 
@@ -32,13 +43,18 @@ def decrypt_key(db: Session) -> tuple[str, str]:
     row = db.get(AIProviderSetting, 1)
     if not row or not row.encrypted_key:
         raise ValueError("请先在设置中配置 DeepSeek API Key")
-    return settings.fernet().decrypt(row.encrypted_key.encode()).decode(), row.model
+    key, migrated = settings.decrypt_secret(row.encrypted_key)
+    if migrated:
+        row.encrypted_key = migrated
+        db.commit()
+    return key, row.model
 
 
 def grounded_answer(db: Session, question: str, subject_id: int | None, chapter_id: int | None, mode: str) -> dict[str, Any]:
     evidence = retrieve(db, question, subject_id, chapter_id)
     citations = [
-        {"chunk_id": chunk.id, "document_id": doc.id, "document_name": doc.name, "locator": chunk.locator, "quote": chunk.content[:220]}
+        {"chunk_id": chunk.id, "document_id": doc.id, "document_name": doc.name,
+         "locator": chunk.locator, "quote": chunk.content}
         for _, chunk, doc in evidence
     ]
     if not citations:
@@ -53,8 +69,9 @@ def grounded_answer(db: Session, question: str, subject_id: int | None, chapter_
     evidence_text = "\n\n".join(f"[C{item['chunk_id']}] {item['document_name']} {item['locator']}\n{item['quote']}" for item in citations)
     mode_instruction = "使用苏格拉底式追问，不直接给最终结论。" if mode == "socratic" else "直接、分层地回答。"
     system = f"""你是严谨的财务考证助教。你只能使用下方证据，不得使用常识补充。{mode_instruction}
-关键结论必须引用 [C数字]。证据不足时必须明确拒答。
-仅输出 JSON：answer, citation_ids, reasoning_type(direct/inference), insufficient_evidence, suggested_materials, follow_up_questions。
+    把回答拆成 claims；每个 claim 必须包含 text、citation_ids 和 reasoning_type(direct/inference)。
+    每项结论必须能由其 citation_ids 对应证据直接支持，禁止仅挂一个不相关引用。证据冲突时不得选边，必须列入 insufficient_evidence。
+    仅输出 JSON：claims, insufficient_evidence, suggested_materials, follow_up_questions。
 证据：\n{evidence_text}"""
     with httpx.Client(timeout=60) as client:
         response = client.post(
@@ -70,13 +87,26 @@ def grounded_answer(db: Session, question: str, subject_id: int | None, chapter_
     except json.JSONDecodeError as exc:
         raise ValueError("DeepSeek 未返回可验证的结构化答案") from exc
     allowed = {item["chunk_id"] for item in citations}
-    used = {int(str(value).lstrip("C")) for value in data.get("citation_ids", []) if str(value).lstrip("C").isdigit()}
-    if not used or not used.issubset(allowed):
-        raise ValueError("模型返回了无效引用，答案已拦截")
+    claims = data.get("claims")
+    if not isinstance(claims, list) or not claims:
+        raise ValueError("模型未返回逐结论引用，答案已拦截")
+    used: set[int] = set()
+    answer_parts: list[str] = []
+    reasoning_types: set[str] = set()
+    for claim in claims:
+        text = str(claim.get("text", "")).strip() if isinstance(claim, dict) else ""
+        raw_ids = claim.get("citation_ids", []) if isinstance(claim, dict) else []
+        claim_ids = {int(str(value).lstrip("C")) for value in raw_ids if str(value).lstrip("C").isdigit()}
+        reasoning_type = claim.get("reasoning_type") if isinstance(claim, dict) else None
+        if not text or not claim_ids or not claim_ids.issubset(allowed) or reasoning_type not in {"direct", "inference"}:
+            raise ValueError("模型返回了无依据结论或无效引用，答案已拦截")
+        used.update(claim_ids)
+        reasoning_types.add(reasoning_type)
+        answer_parts.append(text)
     selected = [item for item in citations if item["chunk_id"] in used]
     return {
-        "answer": data.get("answer", ""), "citations": selected,
-        "reasoning_type": data.get("reasoning_type", "direct"), "grounded": True,
+        "answer": "\n\n".join(answer_parts), "citations": selected,
+        "reasoning_type": "inference" if "inference" in reasoning_types else "direct", "grounded": True,
         "insufficient_evidence": data.get("insufficient_evidence", []),
         "suggested_materials": data.get("suggested_materials", []),
         "follow_up_questions": data.get("follow_up_questions", []),

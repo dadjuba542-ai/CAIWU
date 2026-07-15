@@ -111,9 +111,24 @@ def _pdf_headings(path: Path) -> list[HeadingCandidate]:
         return result
 
 
-def _chunks_for_locator(chunks: list[DocumentChunk], locator: str) -> list[int]:
-    exact = [chunk.id for chunk in chunks if chunk.locator == locator]
-    return exact or ([chunks[0].id] if chunks else [])
+def _chunks_for_heading(
+    chunks: list[DocumentChunk], headings: list[HeadingCandidate], heading_index: int,
+) -> list[int]:
+    """关联标题至下一个同级/更高标题前的完整正文范围。"""
+    heading = headings[heading_index]
+    exact = [chunk for chunk in chunks if chunk.locator == heading.locator]
+    if not exact:
+        return [chunks[0].id] if chunks else []
+    start = min(chunk.position for chunk in exact)
+    end = None
+    for candidate in headings[heading_index + 1:]:
+        if candidate.level > heading.level:
+            continue
+        positions = [chunk.position for chunk in chunks if chunk.locator == candidate.locator]
+        if positions:
+            end = min(positions)
+            break
+    return [chunk.id for chunk in chunks if chunk.position >= start and (end is None or chunk.position < end)]
 
 
 def mechanical_tree(document: Document, chunks: list[DocumentChunk]) -> list[dict]:
@@ -131,8 +146,8 @@ def mechanical_tree(document: Document, chunks: list[DocumentChunk]) -> list[dic
     base_level = min(item.level for item in headings)
     chapters: list[dict] = []
     current = None
-    for heading in headings:
-        source_ids = _chunks_for_locator(chunks, heading.locator)
+    for heading_index, heading in enumerate(headings):
+        source_ids = _chunks_for_heading(chunks, headings, heading_index)
         common = {"title": heading.title, "original_title": heading.title, "confidence": heading.confidence,
                   "source_chunk_ids": source_ids, "source_locators": [heading.locator]}
         if heading.level == base_level or current is None:
@@ -168,7 +183,10 @@ def _enhance_with_deepseek(db: Session, document: Document, tree: list[dict], ch
     setting = db.get(AIProviderSetting, 1)
     if not setting or not setting.encrypted_key:
         return tree, None, "未配置 DeepSeek，已生成规则目录，可稍后重新增强。"
-    key = settings.fernet().decrypt(setting.encrypted_key.encode()).decode()
+    key, migrated = settings.decrypt_secret(setting.encrypted_key)
+    if migrated:
+        setting.encrypted_key = migrated
+        db.commit()
     allowed = {chunk.id for chunk in chunks}
     evidence = [{"chunk_id": chunk.id, "locator": chunk.locator, "text": chunk.content[:500]} for chunk in chunks[:24]]
     prompt = {
