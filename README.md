@@ -40,6 +40,44 @@
 
 4. 打开 `http://localhost:3000`，进入“系统设置”保存并验证 DeepSeek API Key。
 
+## 本地 Docker 软件版
+
+本项目可以作为单机本地软件使用，不需要域名、服务器或备案。先安装并启动 Docker Desktop，然后在项目根目录执行：
+
+```bash
+./scripts/start-local.sh
+```
+
+脚本会自动构建并启动 PostgreSQL、API、worker 和前端，并打开 `http://localhost:3000`。停止服务：
+
+```bash
+./scripts/stop-local.sh
+```
+
+本地资料、数据库、向量模型缓存和备份都保存在 Docker 数据卷中。不要执行 `docker compose down -v`，否则会删除这些本地数据。
+
+首次上传资料时，worker 可能需要下载 `BAAI/bge-small-zh-v1.5` 模型；下载完成后会复用本地模型缓存。
+
+### Windows 启动
+
+Windows 电脑安装并启动 Docker Desktop 后，在 PowerShell 中进入项目根目录，执行：
+
+```powershell
+.\scripts\start-local.ps1
+```
+
+停止服务：
+
+```powershell
+.\scripts\stop-local.ps1
+```
+
+如果 PowerShell 阻止脚本执行，可只对当前窗口放开本地脚本：
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+```
+
 API 文档位于 `http://localhost:8000/docs`。
 
 > 如果更换 `APP_ENCRYPTION_KEY`，已有 DeepSeek Key 将无法解密，需要在设置页重新保存。生产环境禁止使用默认开发密钥。
