@@ -4,7 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle, Archive, ArrowDown, ArrowRight, ArrowUp, BookMarked, BookOpenText, BrainCircuit, Check, ChevronDown,
   ChevronRight, Circle, Clock3, FileText, Flame, FolderTree, GraduationCap, Highlighter,
-  GripVertical, Library, LoaderCircle, Menu, MessageSquareText, NotebookPen, Plus, Quote, RefreshCw,
+  GripVertical, Library, LoaderCircle, Menu, MessageSquareText, MoreHorizontal, NotebookPen, Plus, Quote, RefreshCw,
   Search, Send, Settings, ShieldCheck, Sparkles, Star, Target, Upload, WandSparkles, X,
 } from "lucide-react";
 import { api } from "@/lib/api";
@@ -14,14 +14,21 @@ type View = "dashboard" | "curriculum" | "library" | "study" | "assessment" | "n
 type Toast = { message: string; tone: "ok" | "error" } | null;
 
 const nav: { id: View; label: string; icon: typeof BookOpenText }[] = [
-  { id: "dashboard", label: "今日研习", icon: BookOpenText },
-  { id: "curriculum", label: "课程目录", icon: FolderTree },
-  { id: "library", label: "资料库", icon: Library },
-  { id: "study", label: "AI 研讨", icon: MessageSquareText },
-  { id: "assessment", label: "诊断测验", icon: GraduationCap },
-  { id: "notes", label: "笔记簿", icon: NotebookPen },
-  { id: "review", label: "复习队列", icon: BrainCircuit },
+  { id: "dashboard", label: "今天", icon: BookOpenText },
+  { id: "curriculum", label: "课程", icon: FolderTree },
+  { id: "library", label: "资料", icon: Library },
 ];
+
+const utilityNav: { id: View; label: string; icon: typeof BookOpenText }[] = [
+  { id: "review", label: "复习队列", icon: BrainCircuit },
+  { id: "assessment", label: "章节诊断", icon: GraduationCap },
+  { id: "notes", label: "笔记簿", icon: NotebookPen },
+];
+
+const viewLabels: Record<View, string> = {
+  dashboard: "今天", curriculum: "课程", library: "资料", study: "AI 研讨",
+  assessment: "章节诊断", notes: "笔记簿", review: "复习队列", settings: "设置",
+};
 
 const statusLabel: Record<string, string> = { not_started: "未开始", learning: "学习中", reviewing: "待复习", mastered: "已掌握" };
 const questionTypeLabel: Record<string, string> = { short_answer: "简答题" };
@@ -29,6 +36,7 @@ const questionTypeLabel: Record<string, string> = { short_answer: "简答题" };
 export default function Home() {
   const [view, setView] = useState<View>("dashboard");
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [toolsOpen, setToolsOpen] = useState(false);
   const [exams, setExams] = useState<Exam[]>([]);
   const [docs, setDocs] = useState<Doc[]>([]);
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
@@ -76,7 +84,7 @@ export default function Home() {
     }
   }
 
-  function go(next: View) { setView(next); setMobileOpen(false); }
+  function go(next: View) { setView(next); setMobileOpen(false); setToolsOpen(false); }
   function resumeStudy() {
     const recent = dashboard?.recent_session;
     if (recent?.subject_id) setSelectedSubject(recent.subject_id);
@@ -96,7 +104,9 @@ export default function Home() {
         </div>
         <div className="nav-caption">研习路径</div>
         <nav>
-          {nav.map(item => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><item.icon size={19} /><span>{item.label}</span>{item.id === "review" && reviews.length > 0 && <b>{reviews.length}</b>}</button>)}
+          {nav.map(item => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><item.icon size={19} /><span>{item.label}</span></button>)}
+          <button className={`more-trigger ${toolsOpen || utilityNav.some(item => item.id === view) ? "active" : ""}`} onClick={() => setToolsOpen(value => !value)}><MoreHorizontal size={19} /><span>更多</span>{reviews.length > 0 && <b>{reviews.length}</b>}</button>
+          {toolsOpen && <div className="more-menu">{utilityNav.map(item => <button key={item.id} className={view === item.id ? "active" : ""} onClick={() => go(item.id)}><item.icon size={16} /><span>{item.label}</span></button>)}</div>}
         </nav>
         <div className="sidebar-foot">
           <div className="focus-card"><Target size={18} /><div><span>当前目标</span><strong>{subject?.name || "选择学习科目"}</strong></div><small>{dashboard?.progress ?? 0}%</small></div>
@@ -108,7 +118,7 @@ export default function Home() {
       <section className="workspace">
         <header className="topbar">
           <button className="menu-button" onClick={() => setMobileOpen(true)}><Menu /></button>
-          <div className="crumb"><span>学习台</span><ChevronRight size={14} /><strong>{nav.find(n => n.id === view)?.label || "设置"}</strong></div>
+          <div className="crumb"><span>学习台</span><ChevronRight size={14} /><strong>{viewLabels[view]}</strong></div>
           <div className="top-actions"><button className="icon-button" onClick={refresh} title="刷新"><RefreshCw size={17} className={loading ? "spin" : ""} /></button><div className="date-stamp"><span>{new Date().toLocaleDateString("zh-CN", { month: "long", day: "numeric" })}</span><b>{new Date().toLocaleDateString("zh-CN", { weekday: "short" })}</b></div></div>
         </header>
 

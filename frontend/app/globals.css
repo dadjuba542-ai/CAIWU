@@ -34,6 +34,10 @@ nav button:before, .settings:before { content: ""; width: 2px; position: absolut
 nav button:hover, nav button.active, .settings:hover, .settings.active { background: rgba(255,255,255,.07); color: white; transform: translateX(2px); }
 nav button.active:before, .settings.active:before { background: #d5a36b; }
 nav button b { margin-left: auto; background: var(--red); color: white; min-width: 20px; height: 20px; display: grid; place-items: center; border-radius: 50%; font: 11px Arial; }
+.more-trigger { margin-top: 8px; }
+.more-menu { margin: 0 0 4px 28px; padding: 4px 0 4px 10px; border-left: 1px solid rgba(255,255,255,.12); display: grid; gap: 2px; }
+.more-menu button { border: 0; background: transparent; color: rgba(242,236,223,.52); padding: 9px 10px; display: flex; align-items: center; gap: 9px; width: 100%; text-align: left; font-size: 12px; }
+.more-menu button:hover, .more-menu button.active { color: white; background: rgba(255,255,255,.06); }
 .sidebar-foot { margin-top: auto; }
 .focus-card { margin: 12px 0; padding: 13px; border: 1px solid rgba(255,255,255,.1); display: flex; align-items: center; gap: 9px; background: rgba(255,255,255,.025); }
 .focus-card svg { color: #d5a36b; }
